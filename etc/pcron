@@ -1,0 +1,152 @@
+#!/bin/bash
+
+# Necessary files & directories
+pcron_dir="/etc/pcron"
+pcrontab_file="/etc/pcrontab"
+log_file="/var/log/pcron"
+allow_file="/etc/pcron.allow"
+deny_file="/etc/pcron.deny"
+
+# Run a command necessary for configuring pcron, and exit with error output if it fails
+run_setup_cmd() {
+  if groups "$USER" | grep -q "\bsudo\b"; then sudo="sudo "; else sudo=""; fi
+
+  eval "$sudo$*" > /dev/null 2>&1 || {
+    if [[ "$*" =~ .*mkdir\ +([^ ]+).* || "$*" =~ .*touch\ +([^ ]+).* ]]; then
+        echo "Could not create ${BASH_REMATCH[1]}, you need to run this script at least with privileges" >&2
+    elif [[ "$*" =~ .*chmod\ ([^ ]+)\ ([^ ]+).* ]]; then
+        echo "Could not modify permissions on ${BASH_REMATCH[2]}, you need to run this script at least once with privileges" >&2
+    else
+        echo "An error occurred during setup when running command: '$*'" >&2
+    fi
+    exit 1
+  }
+}
+
+log_message() {
+	echo "$(date +'%Y-%m-%d %H:%M:%S') - $1" >> "$log_file"
+}
+
+# Check user permissions, we first check the allow list, then the deny list
+check_permissions() {
+  local user_groups=($(id -nG))
+
+  if echo "${user_groups[@]}" | grep -q '\broot\b'; then return 0; fi
+
+  if [ -f "$allow_file" ]; then
+    for group in "${user_groups[@]}"; do
+        if grep -q "^$group$" "$allow_file"; then return 0; fi
+    done
+  fi
+
+  if [ -f "$deny_file" ]; then
+    for group in "${user_groups[@]}"; do
+        if grep -q "^$group$" "$deny_file"; then
+          echo "User ${user_groups[0]} doesn't have permissions for pcron" >&2
+          exit 1
+        fi
+    done
+  fi
+}
+
+# Match time field with current time value
+matches_time() {
+	local field="$1"
+	local current_value="$2"
+
+	# Exact match or Star (*) : match value
+	if [[ "$field" == "$current_value" || "$field" == "*" ]]; then return 0; fi
+
+	# Step (*/N) : every N units
+	if [[ "$field" =~ ^\*/([0-9]+)$ ]]; then
+		local step="${BASH_REMATCH[1]}"
+		[[ "$((current_value % step))" -eq 0 ]] && return 0 || return 1
+	fi
+
+	# List of values (X:Y:Z) : match if the value is in the list
+	if [[ "$field" =~ ^([0-9]+(:[0-9]+)*)$ ]]; then
+		IFS=":" read -ra values <<< "$field"
+		for value in "${values[@]}"; do
+			if [[ "$current_value" -eq "$value" ]]; then return 0; fi
+		done
+		return 1
+	fi
+
+	# Interval with exclusions (A-B~X~Y) or without (A-B) : match if value in interval and not excluded
+	if [[ "$field" =~ ^([0-9]+)-([0-9]+)(~[0-9]+)*$ ]]; then
+		local start="${BASH_REMATCH[1]}"
+		local end="${BASH_REMATCH[2]}"
+
+		local excluded_values=()
+		if [[ "$field" =~ (~[0-9]+) ]]; then
+			excluded_values=($(echo "$field" | egrep -o "~[0-9]+" | tr -d "~"))
+		fi
+
+		if [[ "$current_value" -ge "$start" && "$current_value" -le "$end" ]]; then
+			for excluded in "${excluded_values[@]}"; do
+				if [[ "$current_value" -eq "$excluded" ]]; then return 1; fi
+			done
+			return 0
+		fi
+		return 1
+	fi
+
+	return 1  # By default, no match
+}
+
+check_and_run() {
+  read current_sec current_min current_hour current_day current_mon current_weekd < <(date +"%-S %M %H %d %m %u")
+
+  # Create a list of all runnable pcron files
+  files=("$pcron_dir"/*)
+  if [ -f "$pcrontab_file" ]; then
+    files+=("$pcrontab_file")
+  fi
+
+  # Check tasks in /etc/pcron and /etc/pcrontab
+  for file in "${files[@]}"; do
+    if [ ! -r "$file" ]; then continue; fi
+  	while read -r sec min hour day mon weekd command; do
+  	  # Check if this command should run now
+  	  if matches_time "$sec" "$((current_sec / 15))" &&
+  			matches_time "$min" "$current_min" &&
+  			matches_time "$hour" "$current_hour" &&
+  			matches_time "$day" "$current_day" &&
+  			matches_time "$mon" "$current_mon" &&
+  			matches_time "$weekd" "$current_weekd";
+  		then
+  		  eval "$command" &
+        log_message "Executed task from $file: $command"
+  		fi
+  	done < <(grep -v '^ *#' "$file")
+  done
+}
+
+# Setup necessary directories & files, along with their permissions
+if [ ! -d $pcron_dir ]; then
+  echo "Setting up $pcron_dir..."
+  run_setup_cmd mkdir -p $pcron_dir
+  run_setup_cmd chmod a+w $pcron_dir
+fi
+if [ ! -r $pcrontab_file ]; then
+  echo "Creating $pcrontab_file..."
+  run_setup_cmd touch $pcrontab_file
+fi
+if [ ! -f $log_file ]; then
+  echo "Creating $log_file..."
+  run_setup_cmd touch $log_file
+fi
+if [ ! -w $log_file ]; then
+  echo "Setting permissions on $log_file..."
+  run_setup_cmd chmod a+w $log_file
+fi
+
+check_permissions
+
+# Main loop to check scheduled tasks
+while true; do
+  check_and_run &
+
+  # Wait until the next 15-second interval (handles deviation)
+  sleep $((15 - $(date +"%-S") % 15))
+done

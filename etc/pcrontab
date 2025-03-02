@@ -1,0 +1,184 @@
+#!/bin/bash
+
+log_file="/var/log/pcron"
+
+display_usage() {
+	echo "Usage: pcrontab [-u user] {-l | -r | -e}"
+	exit 1
+}
+
+log_message() {
+  local message="$1"
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - $message" >> "$log_file"
+  echo "$message"
+}
+
+parse_file() {
+  # Checking the file is existing and readable
+  if [ ! -r "$1" ]; then
+    log_message "the file can't be read or doesn't exist"
+    return 1
+  else
+    # Define a boolean to be true if the file is correct and false otherwise
+    correct=0
+    # Define the numbers that are allowed for each part of the schedule
+    types=(
+    '[0-3]'
+    '[1-5]?[0-9]'
+    '1?[0-9]|2[0-3]'
+    '[1-2]?[0-9]|3[0-1]'
+    '[1-9]|1[0-2]'
+  	'[0-6]'
+	  )
+    line=1 # Keep track of the lines
+    # Check each lines, not-commented lines should be checked
+    while read -a ligne; do
+      if ! echo "${ligne[@]}" | grep -q '^#' ; then
+        field=0 # Keep track of the field number
+        for mot in "${ligne[@]}"; do
+          if [ "$field" -gt 5 ]; then break; fi
+          if [ "$(echo "$mot" | awk 'BEGIN {FS="-"} {print NF}')" -eq 2 ]; then
+          # Checks if the field is an interval of values, and if the values entered are correct
+            first="$(echo "$mot" | cut -d"-" -f1)"
+            if [ "$(echo "$mot" | awk 'BEGIN {FS="~"} {print NF}')" -lt 2 ]; then
+              last="$(echo "$mot" | cut -d"-" -f2)"
+            else
+              last="$(echo "$mot" | cut -d"~" -f1 | cut -d"-" -f2)"
+            fi
+            if [ "$first" -ge "$last" ]; then
+              correct=1
+              log_message "The interval of the field $((field+1)) on line $line is incorrect : the first value is greater than the second"
+              break
+            else
+              for i in $(seq 2 "$(echo "$mot" | awk 'BEGIN {FS="~"} {print NF}')"); do
+                bannedValue=$(echo "$mot" | cut -d"~" -f"$i")
+                if [ "$bannedValue" -lt "$first" ] || [ "$bannedValue" -gt "$last" ]; then
+                  correct=2
+                  log_message "the excluded value $bannedValue of the field interval $((field+1)) on line $line must be in the initial interval"
+                  break
+                fi
+              done
+            fi
+          fi
+          # Calls the types value that fits with the field number
+          type=${types[$field]}
+          if ! echo "$mot" | grep -E -q "^($type)(:($type))*$|^($type)-($type)(\~($type))*$|^\*\/($type)$|^\*$"; then
+            correct=3
+            log_message "value $mot is incorrect in field $((field+1)) on line $line"
+          fi
+          ((field++))
+        done
+      fi
+    ((line++))
+    done < "$1"
+    return $correct
+  fi
+}
+
+
+file_usage="# Edit this file to introduce tasks to be run by pcron.
+#
+# Each task to run has to be defined through a single line
+# indicating with different fields when the task will be run
+# and what command to run for the task
+#
+# To define the time you can provide concrete values for
+# second (s), minute (m), hour (h), day of month (dom), month (mon),
+# and day of week (dow) or use '*' in these fields (for 'any').
+#
+# Notice that tasks will be started based on the pcron's system
+# daemon's notion of time and timezones.
+#
+# Each action of the pcrontab jobs (including errors) are logged
+# to /var/log/pcron.
+#
+# For example, you can run a backup of all your user accounts
+# at 5 a.m every week with:
+# 0 0 5 * * 1 tar -zcf /var/backups/home.tgz /home/
+#
+# s m h dom mon dow command
+"
+
+# Parse options
+user="$USER"
+while getopts ":u:lre" opt; do
+  case $opt in
+    u) user="$OPTARG" ;;
+    l) action="list" ;;
+    r) action="remove" ;;
+    e) action="edit" ;;
+    *) display_usage ;;
+  esac
+done
+
+if ! id "$user" &>/dev/null; then
+  echo "user \"$user\" doesn't exist"
+  exit 1
+fi
+
+pcron_dir="/etc/pcron"
+pcron_user_file="$pcron_dir/pcrontab${user}"
+
+case $action in
+  list)
+  	if [ -r "$pcron_user_file" ]; then
+  		cat "$pcron_user_file"
+  	else
+  		echo "no pcrontab for $user"
+  	fi
+  	;;
+  remove)
+    if [ "$(id -nu)" == "$user" ] || [ "$(id -nu)" == "root" ]; then
+      rm "$pcron_user_file"
+    else
+      echo "You must be the user or privileged to remove a user pcron file"
+      exit 1
+    fi
+    ;;
+  edit)
+    if [ ! -d "$pcron_dir" ]; then
+      if groups "$USER" | grep -q "\bsudo\b"; then
+        echo "$pcron_dir doesn't exist, creating it..."
+        sudo mkdir -p $pcron_dir
+        sudo chmod a+w $pcron_dir
+      else
+        echo "$pcron_dir doesn't exist, you need to be privileged to create it"
+        exit 1
+      fi
+    fi
+    temp_file="/tmp/pcrontab${user}"
+
+    permissions="user"
+    if [ ! -f "$pcron_user_file" ]; then
+      if [ "$(id -nu)" == "$user" ] || [ "$(id -nu)" == "root" ]; then
+        echo "$file_usage" > "$temp_file"
+        if [ "$(id -nu)" != "$user" ]; then permissions="admin"; fi
+      else
+        echo "You must be privileged to use -u to create a user pcron file"
+        exit 1
+      fi
+    else
+      if [ -w "$pcron_user_file" ] || [ "$(id -nu)" == "root" ]; then
+        cp "$pcron_user_file" "$temp_file"
+        if [ ! -w "$pcron_user_file" ]; then permissions="admin"; fi
+      else
+        echo "You don't have the permissions to edit $user pcron file"
+        exit 1
+      fi
+    fi
+
+    if [ $permissions == "admin" ]; then sudo vi "$temp_file"; else vi "$temp_file"; fi
+
+    until parse_file "$temp_file" ; do
+    	read -p "There is an error in $temp_file, do you wish to fix it (y/n) ? " answer
+    	case "$answer" in
+    	  [yY]) if [ $permissions == "admin" ]; then sudo vi "$temp_file"; else vi "$temp_file"; fi;;
+    	  [nN]) echo "Edits left in $temp_file"; exit 1;;
+    	esac
+    done
+    cp "$temp_file" "$pcron_user_file"
+    if [ $permissions == "admin" ]; then sudo chown "$user":"$user" "$pcron_user_file"; fi
+    rm "$temp_file"
+    ;;
+  *) display_usage ;;
+esac
